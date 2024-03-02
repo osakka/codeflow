@@ -1,0 +1,17 @@
+[[[
+
+  # Application Switcher.
+  IF get.name.defined;
+     global.switchapp_message = 'Application switched to ' _ get.name;
+     global.switchapp = get.name;
+  ELSE;
+    switchapp_message = 'Error: application name not defined.';
+  END;
+
+  TRY;
+    request.redirect = 'apps';
+    INCLUDE main.html;
+  CATCH; switchapp_message = 'Error: cannot reload apps page.';
+  END;
+
+]]]
