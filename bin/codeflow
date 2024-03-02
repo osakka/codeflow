@@ -1,0 +1,1772 @@
+#!/usr/bin/perl -T
+################################################################################
+#
+#  CodeFlow Application Framework Server.
+#  Copyright (c) 2009 SiteOps.  All rights reserved.
+#
+#  Backend Server Daemon.
+#
+#  The use and distribution terms for this software are contained in the file
+#  named license.txt, which can be found in the root of this distribution.
+#  By using this software in any fashion, you are agreeing to be bound by the
+#  terms of this license.
+#
+#  You must not remove this notice, or any other, from this software.
+#  If the license.txt is not found anything to do with using/redistributing
+#  this software is prohibited.
+#
+#  $Author: omar.sakka $
+#  $Revision: 1.163 $
+#  $Date: 2009-12-30 12:37:14 $
+#
+################################################################################
+
+################################################################################
+# Required Libraries.
+################################################################################
+use strict;
+use warnings;
+use diagnostics;
+use DBI;
+use POSIX;
+use IO::Socket;
+use FindBin '$RealBin';
+use JSON::XS;
+use Sys::Syslog;
+use Expect::Simple;
+use Config::Abstract::Ini;
+use Data::Dumper;
+use Template;
+use Template::Exception;
+use Template::Plugin::DBI;
+use Template::Plugin::JSON;
+use Template::Plugin::File;
+use Template::Plugin::Directory;
+use Fcntl qw(:DEFAULT);
+use MLDBM::Sync;
+use MLDBM qw(MLDBM::Sync::SDBM_File);
+use HTTP::Daemon;
+use CGI::Cookie;
+use Getopt::Std;
+use Sub::Override;
+use Carp qw(croak);
+use Time::HiRes qw(gettimeofday tv_interval);
+use IO::Compress::Gzip qw(gzip $GzipError);
+
+#use Net::Flow;
+
+################################################################################
+# Global Variables & Pre-initialization Defines.
+# 'confrel' is the only settable variable in this program.
+# All other settables should be placed in the configuration file.
+# The Path set here is RELATIVE to the root directory not absolute.
+################################################################################
+my $confrel   = '/etc/codeflow.conf';    # Configuration File.
+my $version   = '$Revision: 1.163 $';    # Version from CVS.
+my $hdpt      = Sub::Override->new;      # Override for Sub Object.
+my $outbuffer = '';                      # Output Buffer.
+my %procs;                               # Process Tracker.
+my %config;                              # Configuration Hash (INI File).
+my %script;                              # HouseKeeper Script Counters.
+my $cfg_mtime;                           # Configuration Modification Time.
+my $hdo;                                 # HTTP Daemon Object
+my $rsp;                                 # HTTP Response Object.
+my $dbh;                                 # Database Handle.
+my %fhs;                                 # File Handles.
+my $sid;                                 # Current Session ID.
+my $dbm;                                 # DataBase Handle (IPC).
+my %shmem;                               # Shared Memory Cache.
+
+################################################################################
+# Time Stamper.
+# Output a stamp (return) with HHMMddmmyy for timestamping the log file.
+################################################################################
+sub __tstamp { return strftime "%d%m%y@%H%M", localtime; }
+
+################################################################################
+# Random String Generator.
+# Generates a string of length (len) as specificed by the call.  If nothing is
+# specified, then the length is 6 by default.
+################################################################################
+sub __randstr {
+  my ($len) = @_;
+  my @chars = ( 0, 0 .. 9, 'A' .. 'Z', 'a' .. 'z' );
+  my $str = '';
+
+  $len = 6 if ( !defined($len) );
+  $str .= $chars[ rand @chars ] for 1 .. $len;
+  return $str;
+}
+
+################################################################################
+# Override Product Tokens in HTTP::Daemon.
+# This is to be able to specify our own custom proction tokens in the web
+# server response.
+################################################################################
+$hdpt->replace(
+  'HTTP::Daemon::product_tokens',
+  sub {
+    if ( defined( $config{HTTP}{WebProductTokens} ) ) {
+      return $config{HTTP}{WebProductTokens} . '/' . $version;
+    }
+    else { return $0; }
+  }
+);
+
+################################################################################
+# Rename Running Process.
+# If string sent is prefixed with *, then place a spinner at the end.
+################################################################################
+sub __renproc {
+  my ( $str, $msg ) = @_;
+  my $cnt = 0;
+  my @spinner = ( '|', '/', '-', '\\' );
+
+  # Check the value of String.
+  if   ( $str ne '' ) { $str = ' [' . $str . ']'; }
+  else                { $str = $0; }
+
+  # Check for message existance.
+  # Append a space before the message.
+  $msg = '' if ( !defined($msg) );
+  $msg = ' ' . $msg;
+
+  # Redefine Process Name.
+  if ( defined( $config{INT}{ProcessName} ) ) {
+    if ( $str =~ m/^\s\[(\d)\*(\w+)\]$/ ) {
+      $cnt = $1;
+      $cnt = 0 if ( $cnt >= 4 );
+      $str = ' [' . $2 . ']';
+      $str = $str . ' (' . $spinner[$cnt] . ')';
+      $cnt++;
+    }
+    $str = $config{INT}{ProcessName} . $str;
+    $0   = $str . $msg;
+  }
+  $0 = $str . $msg;
+  return $cnt;
+}
+
+################################################################################
+# Log to Syslog.
+################################################################################
+sub __slog {
+  my ( $str, $lvl ) = @_;
+
+  # Ensure that there is a LogLevel set.
+  $config{LOG}{SysLogLevel} = 'info'
+    if ( !defined( $config{LOG}{SysLogLevel} ) );
+  $lvl = $config{LOG}{SysLogLevel} if ( !defined($lvl) );
+
+  # Send logging to Syslog.
+  if ( defined( $config{LOG}{SysLogEnabled} ) ) {
+    if ( $config{LOG}{SysLogEnabled} ) {
+      syslog( "$lvl|$config{LOG}{SysLogFacility}", $str );
+      return 1;
+    }
+  }
+  return 0;
+}
+
+################################################################################
+# Remark.
+################################################################################
+sub __log {
+  my ( $str, $lvl ) = @_;
+  my ($sub_log_handle);
+  my $sub = ( caller(1) )[3];
+
+  # If the sub is defined, mangle it.
+  if ( defined($sub) ) {
+    $sub =~ s/main:://;
+    $sub =~ s/__//g;
+    $sub_log_handle = $sub;
+    if   ( $sub eq 'ANON' ) { $sub = ''; }
+    else                    { $sub = '[' . $sub . '] '; }
+  }
+  else { $sub = ''; }
+
+  # If the string 'content' is not define, set it to blank.
+  $str = '' if ( !defined($str) );
+
+  # If the sub_loh_handle = '', set it to anonymous
+  $sub_log_handle = 'anonymous' if ( !defined($sub_log_handle) );
+
+  # Check that the Logging Sub is switched on.
+  if (    defined( $config{LOG}{SUBS}{$sub_log_handle} )
+       || defined( $config{LOG}{SUBS}{ALL} ) )
+  {
+    if ( $config{LOG}{SUBS}{$sub_log_handle} || $config{LOG}{SUBS}{ALL} ) {
+      if ( !&__slog( $sub . $str, $lvl ) ) {
+        print '[' . $$ . ']' . "\t" . &__tstamp . " > $sub$str\n";
+        return 1;
+      }
+    }
+  }
+
+  # Exit Prematurely.
+  return 0;
+}
+
+################################################################################
+# Setup Syslog.
+# Remember to call this after your parent fork in order to have the right
+# pid displayed.
+################################################################################
+sub __log_handler {
+  my ($name);
+
+  if ( defined( $config{LOG}{SysLogEnabled} ) ) {
+    if ( $config{LOG}{SysLogEnabled} ) {
+      if ( defined( $config{INT}{ProcessName} ) ) {
+        $name = $config{INT}{ProcessName};
+      }
+      else { $name = 'undef'; }
+      $name = $name . '[' . $$ . ']';
+      croak 'cannot open syslog' if ( !openlog( $name, 'ndelay', 'user' ) );
+    }
+  }
+}
+
+################################################################################
+# Output Handler.
+# Will keep buffering what is sent to it.
+# Send the defined reset command, and reset buffers.
+################################################################################
+sub __out {
+  my ($str) = @_;
+
+  # Ensure that the String Contains Something (is defined).
+  # Define the Output Buffer if not yet defined.
+  $str       = '' if ( !defined($str) );
+  $outbuffer = '' if ( !defined($outbuffer) );
+
+  # Reset Command Has Been Sent.
+  if ( defined( $config{INT}{OutReset} ) ) {
+    if ( $str eq $config{INT}{OutReset} ) {
+      $outbuffer = '';
+      $str       = '';
+    }
+  }
+
+  # Push more into the end of the buffer.
+  $outbuffer .= $str;
+  return $outbuffer;
+}
+
+################################################################################
+# Location Standardization Routine.
+# Should be run to standardize locations.
+################################################################################
+sub __locstd {
+  my ($relpath) = @_;
+  my ($cwd);
+
+  $relpath = '' if ( !defined($relpath) );
+  return $RealBin . $relpath;
+}
+
+################################################################################
+# Timer.
+# Returns time in milliseconds between the start, and stop.
+# Start with start, and get reading with stop.
+################################################################################
+sub __timer {
+  my ($t) = @_;
+
+  if   ( defined($t) ) { $t = ( tv_interval $t ) * 1000; }
+  else                 { $t = [gettimeofday]; }
+  return $t;
+}
+
+################################################################################
+# Reaper.
+# A reaper of dead processes (children).
+################################################################################
+sub __reaper {
+  my ( $stiff, $name, $key );
+
+  while ( ( $stiff = waitpid( -1, &WNOHANG ) ) > 0 ) {
+
+    # Check Who Exactly we are talking about.
+    # Need to identify the Caller type for the process.
+    foreach $key ( keys %procs ) {
+      next if ( $key eq 'count' );
+      if ( defined( $procs{$key}{$stiff} ) ) {
+        $name = $key;
+        last;
+      }
+    }
+
+    # Ensure that the name has been defined.
+    return 0 if ( !defined($name) );
+
+    __log $name
+      . ' process ['
+      . $stiff
+      . '] terminated with status ['
+      . $? . ']';
+
+    # Reap a Process.
+    if ( defined( $procs{$name}{$stiff} ) ) {
+      $procs{count}{$name}--;
+      delete $procs{$name}{$stiff} if ( defined( $procs{$name}{$stiff} ) );
+      __log 'current process count for ' . $name . ' = ' . $procs{count}{$name};
+    }
+
+    # Child Signal Handler (Reinstate)
+    $SIG{CHLD} = \&__reaper;
+
+  }
+}
+
+################################################################################
+# Process(es) Killer.
+################################################################################
+sub __killer {
+  my ($key) = @_;
+
+  if ( defined($key) ) {
+    if ( defined( $procs{$key} ) ) {
+      __log 'request to kill all processes of type: ' . $key;
+      kill 'TERM' => keys %{ $procs{$key} };
+    }
+  }
+  else {
+    foreach $key ( keys %procs ) {
+      next if ( $key eq 'count' );
+      __log 'request to kill all processes of type: ' . $key;
+      kill 'TERM' => keys %{ $procs{$key} };
+    }
+  }
+}
+
+################################################################################
+# Signal Handler.
+# Can Pass Two Special Cases, one is supervisor, and the other is safe.
+################################################################################
+sub __sig_handler {
+  my ($cmd) = @_;
+  my ( $sig, $msg );
+
+  # Ensure that the $cmd variable is defined.
+  $cmd = 'undef' if ( !defined($cmd) );
+
+  # Logging Information.
+  __log 'installing signal handler: ' . $cmd;
+
+  # Handle Die.
+  $SIG{__WARN__} = sub {
+    __log $cmd . '->signal->warn: ' . join( " ", @_ );
+
+    # Cleanup code for supervisor Termination.
+    if ( $cmd eq 'supervisor' ) { &__killer; }
+    exit if ( $cmd ne 'safe' );
+  };
+
+  # Special Supervisor Signal.
+  if ( $cmd eq 'supervisor' ) {
+    $SIG{USR1} = sub {
+      &__killer('http');
+      &__killer('radius');
+    };
+  }
+
+  # For Non Safe Signals.
+  if ( $cmd ne 'safe' ) {
+    $SIG{KILL} = $SIG{HUP} = $SIG{TERM} = sub {
+      $sig = shift;
+      $SIG{$sig} = 'IGNORE';
+      __log 'signalled ' . $cmd . ' process - ' . $sig;
+
+      # Cleanup code for supervisor Termination.
+      if ( $cmd eq 'supervisor' ) { &__killer; }
+      exit;
+    };
+  }
+
+  # Instate Child Signal Handler for Supervisor.
+  if ( $cmd eq 'supervisor' ) { $SIG{CHLD} = \&__reaper; }
+
+  # Install Alarm Signal based on caller.
+  # Regardless of caller.  Please be carefull what is added
+  # in the configuration file, as things may go wild.
+  if ( defined( $config{INT}{TIMEOUTS}{$cmd} ) ) {
+    __log 'setting timeout for ' 
+      . $cmd . ' to '
+      . $config{INT}{TIMEOUTS}{$cmd}
+      . ' seconds';
+    $SIG{ALRM} = sub {
+      __log $cmd . '->signal->alarm: timeout ' . $config{INT}{TIMEOUTS}{$cmd};
+      __log $cmd . 'killing process...';
+      exit;
+    };
+  }
+
+  # Clean Return.
+  return 1;
+}
+
+################################################################################
+# Handle Timeouts, this should be specific to a function, and clear command
+# should be sent on regular completion.
+################################################################################
+sub __timeout_handler {
+  my ( $caller, $cmd ) = @_;
+
+  if ( defined( $config{INT}{TIMEOUTS}{$caller} ) ) {
+    if ( $cmd eq 'start' ) {
+      alarm( $config{INT}{TIMEOUTS}{$caller} );
+      __log $caller
+        . ' timeout = '
+        . $config{INT}{TIMEOUTS}{$caller}
+        . ' seconds';
+    }
+    else {
+      alarm(-1);
+      __log $caller . ' timeout cleared';
+    }
+  }
+  else { __log $caller . 'timeout undefined'; }
+
+  # Clean Return.
+  return 1;
+}
+
+################################################################################
+# IPC Shared Cache.
+# Used for sharing data between Inter-Processes.
+################################################################################
+sub __ipccache {
+  my ( $cmd, $sid, $ns, $key, $val ) = @_;
+  my ($tmp);
+
+  # If Session Handling is Disabled, Exit.
+  if ( defined( $config{HTTP}{SESSION}{Enabled} ) ) {
+    return 1 if ( !$config{HTTP}{SESSION}{Enabled} );
+  }
+
+  # Initialize the IPC shared memory hash.
+  if ( $cmd eq 'initialize' ) {
+    if ( defined( $config{HTTP}{SESSION}{dBFile} ) ) {
+
+      # Tie the Hash.
+      $dbm = tie( %shmem, 'MLDBM::Sync',
+                  &__locstd( $config{HTTP}{SESSION}{dBFile} ),
+                  O_CREAT | O_RDWR, 0640 )
+        or croak 'cannot setup IPC shared memory';
+
+      # Create a Cache in Memory for faster access.
+      if ( defined( $config{HTTP}{SESSION}{Cache} ) ) {
+        $dbm->SyncCacheSize( $config{HTTP}{SESSION}{Cache} );
+      }
+
+      return 1;
+    }
+    else { __log 'HTTP::SESSION::dBFile is not defined'; }
+  }
+
+  # Cleanup a specific user session.
+  # The only thing we do not cleanup is the globalstash, and expire variables.
+  if ( $cmd eq 'cleanup' ) {
+    if ( defined( $shmem{$sid} ) ) {
+      $dbm->Lock;
+
+      # Store the expire time.
+      if ( defined( $shmem{$sid}{expire} ) ) {
+        $tmp->{expire} = $shmem{$sid}{expire};
+      }
+
+      # Store the GlobalStash.
+      if ( defined( $shmem{$sid}{ $config{INT}{GlobalStash} } ) ) {
+        $tmp->{ $config{INT}{GlobalStash} } =
+          $shmem{$sid}{ $config{INT}{GlobalStash} };
+      }
+
+      # Delete the Old Session Store.
+      # Replace the Session Store.
+      # Unlock.
+      delete $shmem{$sid};
+      $shmem{$sid} = $tmp;
+      $dbm->UnLock;
+      return 1;
+    }
+  }
+
+  # Store KV Pair in Session.
+  # Based on Namespace we are currently in.
+  if ( $cmd eq 'store' ) {
+
+    # If Value is not defined, this is a restamping or creation
+    # request, we call this a ROOT request.
+    $dbm->Lock;
+    if ( !defined($val) ) {
+      __log $sid . ': root request, key [' . $ns . '] = ' . $key;
+      $tmp         = $shmem{$sid};
+      $tmp->{$ns}  = $key;
+      $shmem{$sid} = $tmp;
+    }
+    else {
+      if ( defined( $shmem{$sid} ) ) {
+        __log $sid . '[' . $ns . '] request, key [' . $key . '] = ' . $val;
+        $tmp                = $shmem{$sid};
+        $tmp->{$ns}->{$key} = $val;
+        $shmem{$sid}        = $tmp;
+      }
+      else {
+        __log 'cannot store data in invalid session';
+      }
+    }
+    $dbm->UnLock;
+    return 1;
+  }
+
+  # Clear a Session Entry (Complete).
+  # This completely removes a session and it's entries.
+  if ( $cmd eq 'delete' ) {
+    $dbm->Lock;
+    delete $shmem{$sid} if ( defined( $shmem{$sid} ) );
+    $dbm->UnLock;
+    return 1;
+  }
+
+  # Garbage Collector.
+  # Loop through the shared memory tied hash, and expire sessions.
+  # We also remove invalid sessions.
+  if ( $cmd eq 'collector' ) {
+
+    foreach my $key ( keys %shmem ) {
+      if ( defined( $shmem{$key}{expire} ) ) {
+        if ( $shmem{$key}{expire} le time ) {
+
+          # Print out session specifics if required.
+          if ( defined( $config{HTTP}{SESSION}{Debug} ) ) {
+            if ( $config{HTTP}{SESSION}{Debug} ) {
+              __log 'session id: ' . $key . ' (expire)';
+            }
+          }
+
+          # Delete an Expired Session.
+          &__ipccache( 'delete', $key );
+        }
+
+        # Create a countdown timer, and tack it onto
+        # the user session.  Good for visual session lifetime.
+        else {
+
+          # Ensure that we have an expire time set on the session.
+          if ( defined( $shmem{$key}{expire} ) ) {
+            &__ipccache( 'store', $key, 'timer', $shmem{$key}{expire} - time );
+          }
+
+        }
+      }
+      else {
+
+        # Print out session specifics if required.
+        if ( defined( $config{HTTP}{SESSION}{Debug} ) ) {
+          if ( $config{HTTP}{SESSION}{Debug} ) {
+            __log 'session id: ' . $key . ' (invalid)';
+          }
+        }
+
+        # Delete an Invalid Session.
+        &__ipccache( 'delete', $key );
+      }
+    }
+
+    # Spit out Marker Information (Dump the Hash).
+    if ( defined( $config{HTTP}{SESSION}{Marker} ) ) {
+      if ( $config{HTTP}{SESSION}{Marker} ) {
+        __log '-- ipccache collector --';
+      }
+    }
+
+    # End of Garbage Collection.
+    return 1;
+  }
+
+  # Default Return on no success.
+  return 0;
+}
+
+################################################################################
+# Load Template File.
+################################################################################
+sub __template_handler {
+  my ($file) = @_;
+  my ( $tpl, %tmp, $vars, $stash, $error );
+
+  # Install Specific Signal Handler.
+  $file = 'undefined' if ( !defined($file) );
+
+  # Create A temporary Copy of the Template Toolkit Variables.
+  # We want this since we should not do not want to store
+  # mangled paths in the configuration file if we write automagically.
+  %tmp = %{ $config{TTKIT} };
+  $tmp{INCLUDE_PATH} = &__locstd( $config{INT}{RootDir} );
+
+  # Render requested Template if available.
+  #  OR Render Error Page.
+  #  OR Render An Error Message.
+  if ( $tpl = Template->new(%tmp) ) {
+    if ( -r $tmp{INCLUDE_PATH} . '/' . $file ) {
+
+      # Check if the SID is defined, and if so allow
+      # access to the shared memory segment by the template.
+      # Place some more variables within the reach of the Templating Engine.
+      if ( defined($sid) ) {
+        if ( defined( $shmem{$sid} ) ) {
+          $vars = $shmem{$sid};
+          $vars->{CLEANUP} = \&__ipccache( 'cleanup', $sid );
+          $vars->{cwd}     = $tmp{INCLUDE_PATH};
+          $vars->{false}   = JSON::XS::false;
+          $vars->{true}    = JSON::XS::true;
+
+          # Configure the TTVars, and export into the Config Stash.
+          # These are refreshed with each request incase they change.
+          # This may change in the future.
+          if ( defined( $config{INT}{ConfigStash} ) ) {
+            if ( defined( $config{TTVars} ) ) {
+              $vars->{ $config{INT}{ConfigStash} } = $config{TTVars};
+            }
+          }
+
+        }
+      }
+
+      # Ensure that any additions are under this line since the session
+      # variables will overwrite them otherwise.
+      $vars->{dbh} = $dbh;
+
+      # Process Template File.
+      # Output it to the Receiving End (The Output Handler).
+      # We should probably move this somewhere else.
+      $tpl->process( $file, $vars, \&__out ) || do {
+        $rsp->code(501);
+        $rsp->header( 'Content-Type' => &__mime_handler('text') );
+        $error = $tpl->error();
+        __out "Template Error\n";
+        __out "--------------\n";
+        __out 'Type : ' . $error->type() . "\n";
+        __out 'Info : ' . $error->info() . "\n\n";
+        __out 'Please report this error,' . "\n";
+        __out 'stating the fill URI (in the top bar)' . "\n";
+        return 0;
+      };
+
+      # Variable Stasher.
+      # We Take Globally Stashed Variables from Templates, and
+      # Store them within the user's session. (Persistant).
+      # To Reuse the variable, it is under GlobalStash.
+      if ( defined($sid) ) {
+        $dbm->Lock;
+        $vars  = $shmem{$sid};
+        $stash = $tpl->{SERVICE}->{CONTEXT}->{STASH}->{global};
+        foreach ( %{$stash} ) {
+          if ( defined( $stash->{$_} ) ) {
+            $vars->{ $config{INT}{GlobalStash} }->{$_} = $stash->{$_};
+          }
+        }
+        $shmem{$sid} = $vars;
+        $dbm->UnLock;
+
+        # Output Variable Dump if defined.
+        if ( $config{HTTP}{SESSION}{Debug} ) {
+          __log Dumper $shmem{$sid};
+        }
+      }
+
+      return 1;
+    }
+    else { __out 'Error: Template ' . $file . ' not available'; }
+  }
+  else { __out 'Error: Template Toolkit ' . $tpl->error(); }
+  return 0;
+}
+
+################################################################################
+# Database Handler.
+# Connect and disconnect from the main database as specified by the
+# configuration file.  This will allow us to open a single database connection
+# per process, and not keep opening and closing the connection.  For
+# processes that need to connect to alternative databases, this can be done
+# from within the specific template.
+################################################################################
+sub __db_handler {
+  my ( $cmd, $sub ) = @_;
+  my $dsn;
+
+  # If the default Database is Disabled, Exit.
+  if ( defined( $config{DB}{Enabled} ) ) {
+    return 1 if ( !$config{DB}{Enabled} );
+  }
+
+  # Ensure that a sub name has been passed.
+  # Otherwise check if anonymous called is enabled.
+  $sub = 'anonymous' if ( !defined($sub) );
+
+  # Database Connect Requested.
+  if ( $cmd eq 'connect' ) {
+
+    # Check that the Database Sub is switched on.
+    # This will allow us to activate DB handling per process type.
+    # We should only allow a connection if it has been defined, and
+    # the value is 1.
+    if ( defined( $config{DB}{SUBS}{$sub} ) ) {
+      return 1 if ( !$config{DB}{SUBS}{$sub} );
+    }
+    else { return 1; }
+
+    # Check that some of our most important values are defined.
+    # without these, we cannot establish a database connection.
+    return 0
+      if (    !defined( $config{DB}{Driver} )
+           || !defined( $config{DB}{Hostname} )
+           || !defined( $config{DB}{Port} )
+           || !defined( $config{DB}{Database} ) );
+    $config{DB}{OPTS} = '' if ( !defined( $config{DB}{OPTS} ) );
+
+    # Define the DSN from the values in the configuration file.
+    $dsn = 'DBI:'
+      . $config{DB}{Driver}
+      . ':database='
+      . $config{DB}{Database}
+      . ';host='
+      . $config{DB}{Hostname}
+      . ';port='
+      . $config{DB}{Port};
+    if (
+         $dbh = DBI->connect( $dsn,                  $config{DB}{Username},
+                              $config{DB}{Password}, \%{ $config{DB}{OPTS} } )
+      )
+    {
+
+      # Database connection is successfull.
+      __log $sub
+        . ' successfull database connection to: '
+        . $config{DB}{Database};
+      return 1;
+    }
+    else {
+
+      # Database connection is unsuccessfull.
+      __log $sub . ' failed database connection to: ' . $config{DB}{Database};
+    }
+  }
+
+  # Database disconnection Requested.
+  if ( $cmd eq 'disconnect' ) {
+    if ($dbh) {
+      if ( $dbh->disconnect ) {
+        __log ' disconnected from database';
+        return 1;
+      }
+      else {
+        __log 'cannot disconnect from database';
+      }
+    }
+  }
+
+  # If reached here, then something went wrong.
+  # However we check if we want the process to die, or just carry on
+  # if there is a failure to connect to the database.
+  if ( defined( $config{DB}{Fatal} ) ) {
+    return 1 if ( !$config{DB}{Fatal} );
+  }
+  return 0;
+}
+
+################################################################################
+# Load Respource File.
+################################################################################
+sub __resource_handler {
+  my ($file) = @_;
+  my $fh;
+
+  $file = 'undefined' if ( !defined($file) );
+  if ( defined( $config{INT}{RootDir} ) ) {
+    $file = &__locstd( $config{INT}{RootDir} . '/' . $file );
+    if ( open( $fhs{resource}, '<', $file ) ) {
+      local $/ = undef;
+      binmode( $fhs{resource} );
+      $fh = $fhs{resource};
+      __out(<$fh>);
+      close( $fhs{resource} );
+      return 1;
+    }
+    else { __out 'Error: Requested Resource Unavailable'; }
+  }
+  else { __out 'Error: Root directory undefined'; }
+  return 0;
+}
+
+################################################################################
+# Mime Type Identifier.
+################################################################################
+sub __mime_handler {
+  my ($ext) = @_;
+
+  # If MIME type is unknown.
+  if ( !defined( $config{HTTP}{MIME}{$ext} ) ) {
+    $ext = 'DEFAULT';
+
+    # Use Default MIME type.
+    return 'text/plain' if ( !defined( $config{HTTP}{MIME}{$ext} ) );
+  }
+  return $config{HTTP}{MIME}{$ext};
+}
+
+################################################################################
+# Load Configuration File.
+################################################################################
+sub __config_handler {
+  my ($file) = @_;
+  my ( $cobj, $mtime );
+  my $reload = 0;
+
+  if ( defined($file) ) {
+
+    if ( -r "$file" ) {
+
+      # Get Last Modification Time.
+      $mtime = ( stat($file) )[9];
+
+      # Check if Modification Timestamps are the same, otherwise
+      # Reload the configuration.
+      if ( defined($cfg_mtime) ) {
+        if   ( $cfg_mtime >= $mtime ) { return 1; }
+        else                          { $reload = 1; }
+      }
+
+      # Load Configuration.
+      __log "loading file [$file]";
+      $cobj   = new Config::Abstract::Ini($file);
+      %config = $cobj->get_all_settings;
+
+      # Stamp Configuation Modification Time.
+      $cfg_mtime = $mtime;
+
+      # Kill Workers for Reload.
+      # This is to reflest the new changes.
+      kill 'USR1' => $$ if ($reload);
+
+      # Clean Return.
+      return 1;
+    }
+    else { croak 'configuration file not readable'; }
+  }
+  else { croak ' configuration file not defined'; }
+  return 0;
+}
+
+################################################################################
+# Process ID Status Checker, and Locker.
+################################################################################
+sub __pidchk {
+  my ( $file, $cmd ) = @_;
+  my $pid = $$;
+  my $fh;
+
+  if ( $cmd eq 'lock' ) {
+    if ( !&__pidchk( $file, "status" ) ) {
+      if ( open( $fhs{pid}, '>', $file ) ) {
+        __log "process [" . $pid . "] started";
+        print { $fhs{pid} } "$pid";
+        close( $fhs{pid} );
+        return 1;
+      }
+      else { __log 'cannot write process id to ' . $file; }
+    }
+  }
+  elsif ( $cmd eq 'unlock' ) {
+    if ( $pid = &__pidchk( $file, "status" ) ) {
+      if ( kill 'TERM' => $pid ) {
+        if ( open( $fhs{pid}, '>', $file ) ) {
+          __log "process [" . $pid . "] terminated";
+          print { $fhs{pid} } '';
+          close( $fhs{pid} );
+          return 1;
+        }
+        else { __log "cannot write process id"; }
+      }
+      else { __log "cannot kill process [" . $pid . "]"; }
+    }
+  }
+  elsif ( $cmd eq 'status' ) {
+    if ( defined($file) ) {
+      if ( open( $fhs{pid}, '<', $file ) ) {
+        $fh = $fhs{pid};
+        while (<$fh>) {
+          if ( $_ =~ m/^(\d+)$/ ) {
+            $pid = $1;
+            __log "process [" . $pid . "] in process id file";
+            if ( -e '/proc/' . $pid ) {
+              __log "process [" . $pid . "] running";
+              return $pid;
+            }
+          }
+          else { __log "invalid data in process id file"; }
+        }
+        close( $fhs{pid} );
+      }
+      else { __log "error reading process id file"; }
+    }
+    else { __log "please define process id file"; }
+    $pid = 'broken-process-id';
+  }
+  return 0;
+}
+
+################################################################################
+# Session Cookie Handler.
+################################################################################
+sub __session_handler {
+  my ( $cmd, $ucs ) = @_;
+  my ( $key, $cookie, %cookies, $tmp );
+
+  # If Session Handling is Disabled, Exit.
+  if ( defined( $config{HTTP}{SESSION}{Enabled} ) ) {
+    return 1 if ( !$config{HTTP}{SESSION}{Enabled} );
+  }
+
+  # Get a Cookie if one is found.
+  if ( $cmd eq 'get' ) {
+    if ( defined($ucs) ) {
+      %cookies = parse CGI::Cookie($ucs);
+      if ( defined( $config{HTTP}{SESSIONCOOKIE}{'-name'} ) ) {
+        $key = $config{HTTP}{SESSIONCOOKIE}{'-name'};
+
+        # Check if Our Specific Cookie is set.
+        if ( defined( $cookies{$key}{value} ) ) {
+          $key = join( '', @{ $cookies{$key}{value} } );
+
+          # Check if key is an active session key.
+          if ( defined( $shmem{$key} ) ) {
+
+            # Update Timestamp.
+            $tmp = time + $config{HTTP}{SESSION}{TimeOut};
+            &__ipccache( 'store', $key, 'expire', $tmp );
+            $sid = $key;
+
+            # Print out session specifics if required.
+            if ( defined( $config{HTTP}{SESSION}{Debug} ) ) {
+              if ( $config{HTTP}{SESSION}{Debug} ) {
+                __log 'session id: ' . $key . ' (active)';
+              }
+            }
+            return 1;
+          }
+        }
+        else {
+
+          # There was a cookie we do not know.
+          # We can alert the administrator to it's existance in out logs.
+          if ( defined( $config{HTTP}{SESSION}{BadCookie} ) ) {
+            if ( $config{HTTP}{SESSION}{BadCookie} ) {
+              __log 'cookie with invalid name returned';
+            }
+          }
+        }
+      }
+      else { __log 'cookie configuration error, no name'; }
+    }
+
+    # Cookie is Invalid or does not exist.
+    return 0;
+  }
+
+  # Set a cookie if one is not found.
+  if ( $cmd eq 'set' ) {
+
+    if ( defined( $config{HTTP}{SESSIONCOOKIE} ) ) {
+
+      # Generate a Session Key for the User.
+      if ( defined( $config{HTTP}{SESSION}{KeyLength} ) ) {
+        $key = &__randstr( $config{HTTP}{SESSION}{KeyLength} );
+      }
+      else { $key = &__randstr; }
+
+      # Get a copy of our current session id.
+      $sid = $key;
+
+      # Print out session specifics if required.
+      if ( defined( $config{HTTP}{SESSION}{Debug} ) ) {
+        if ( $config{HTTP}{SESSION}{Debug} ) {
+          __log 'session id: ' . $key . ' (new)';
+        }
+      }
+
+      # Create Session for User.
+      # Timeout is preset pre initialization to 3600 (1 Hour).
+      $tmp = time + $config{HTTP}{SESSION}{TimeOut};
+      &__ipccache( 'store', $key, 'expire', $tmp );
+
+      # Create the cookie.
+      $config{HTTP}{SESSIONCOOKIE}{'-value'} = $key;
+      $cookie = new CGI::Cookie( %{ $config{HTTP}{SESSIONCOOKIE} } );
+      if   ( defined($cookie) ) { return $cookie->as_string; }
+      else                      { __log 'cookie configuration error'; }
+    }
+    else { __log 'cookie configuration not found'; }
+
+    # Cookie cannot be set for some reason.
+    return 0;
+  }
+}
+
+################################################################################
+# Housekeeping Script Handler.
+################################################################################
+sub __housekeeper {
+
+  #my ($file) = @_;
+  my $file = $script{current_script};
+
+  # We are nof officially a housekeeper.
+  __renproc 'housekeeper', 'running: ' . $file;
+
+  # Check the FileName (Script for Housekeeping)
+  $file = '' if ( !defined($file) );
+
+  # Timeout for HouseKeepers.
+  &timeout_handler( 'housekeeper', 'start' );
+
+  # Cleanup up variable content.
+  __out $config{INT}{OutReset};
+
+  # Die Signal Disabler.
+  if ( defined( $config{HKEEPER}{FatalErrors} ) ) {
+    &__sig_handler('safe') if ( !$config{HKEEPER}{FatalErrors} );
+  }
+
+  # Run the Template Handler for the housekeeping file.
+  if ( &__template_handler($file) ) {
+
+    if ( defined( $config{HKEEPER}{RunLog} ) ) {
+      if ( $config{HKEEPER}{RunLog} ) {
+        &__log( 'housekeeper: [' . $file . '] follows: ', 'debug' );
+        &__log( &__out,                                   'debug' );
+      }
+    }
+  }
+
+  # Exit Process.
+  # This is the end of the Spawned Process.
+  &timeout_handler( 'housekeeper', 'clear' );
+  exit;
+}
+
+################################################################################
+# Parse URI Query String.
+# Place key value pairs in special variable location.
+# Within the session hash.
+################################################################################
+sub __querystring {
+  my ( $sid, $method, $str ) = @_;
+  my ( @in, $key, $value, @tmp );
+
+  # Convert method to lower case, and append an underscore.
+  $method = lc($method);
+
+  # Print out some debugging information.
+  if ( defined( $config{HTTP}{DebugQS} ) ) {
+    if ( $config{HTTP}{DebugQS} ) {
+      __log 'Session ID: [' . $sid . ']';
+      __log 'Method:     [' . $method . ']';
+      __log 'String:     [' . $str . ']';
+    }
+  }
+
+  # Parse the Key Value Pairs.
+  if ( defined($str) ) {
+    @in = split /&/, $str;
+    foreach ( 0 .. $#in ) {
+      $in[$_] =~ s/\+/ /g;
+      ( $key, $value ) = split /=/, $in[$_], 2;
+      $key = '' if ( !defined($key) );
+      $key =~ s/%(..)/pack("c",hex($1))/ge;
+      $value = '' if ( !defined($value) );
+      $value =~ s/%(..)/pack("c",hex($1))/ge;
+      $value =~ s/<!--(.|\n)*-->//g;
+
+      # Check if it was a JSON QUERY, this should be handled.
+      # We know it's a JSON Query if the Value is '', and the key
+      # is { ... }
+      # Store Values within the shared memory space.
+      # This way we all know what we want, and how to get
+      # to it if using templates.
+      if ( ( $key =~ qr/^\[?\{(.*)\}\]?$/ ) && ( $value eq '' ) ) {
+        @tmp = decode_json($key);
+        &__ipccache( 'store', $sid, 'json', @tmp );
+        __log Dumper @tmp if ( defined( $config{HTTP}{DebugJSON} ) );
+      }
+      else {
+        &__ipccache( 'store', $sid, $method, $key, $value );
+        __log 'kv pair [' . $key . ' -> ' . $value . ']';
+      }
+    }
+  }
+
+  return 1;
+}
+
+################################################################################
+# Response Handler.
+# Get URL, and URL_TYPE.
+# Return Output.
+################################################################################
+sub __response_handler {
+  my ( $req, $ip, $timer, $gzipencode ) = @_;
+  my ( $rtype, $rloc, $ctype, $qstr, $fname, $oreq, $gzin, $gzout );
+
+  # Stop DIE from Exiting Prematurely.
+  &__sig_handler('safe');
+
+  # Handle Query Types.
+  # Parse the Request into Request Type, Content Type, and Location.
+  if ( $req =~ qr/^\/(\w+):(\w+):($config{INT}{URIRegex})?$/ ) {
+    $rtype = $1;
+    $ctype = $2;
+    $rloc  = $3;
+
+    # Search and Replace the if Specificed.
+    # This is the directory substitution character.
+    if ( defined( $config{INT}{DirSub} ) ) {
+      $rloc =~ s/$config{INT}{DirSub}/\//g;
+    }
+
+    # Create the filename from the URI (file location), and Type.
+    $fname = $rloc . '.' . $ctype;
+
+    # Detect Mime Type.
+    $rsp->header( 'Content-Type' => &__mime_handler($ctype) );
+
+    # Handle Dynamic Content.
+    if ( $rtype eq $config{INT}{Dynamic} ) {
+      $rsp->code(200) if &__template_handler($fname);
+    }
+
+    # Handle Static Content.
+    elsif ( $rtype eq $config{INT}{Static} ) {
+      if   ( &__resource_handler($fname) ) { $rsp->code(200); }
+      else                                 { $rsp->code(404); }
+    }
+
+    # Invalid Type Detected.
+    else {
+      __out 'Error: invalid URL type specified';
+      $rsp->code(501);
+    }
+  }
+
+  # Handle Redirection Queries.
+  elsif ( defined( $config{HTTP}{REDIRECTS}{"$req"} ) ) {
+    &__response_handler( '/' . $config{HTTP}{REDIRECTS}{$req},
+                         $ip, $timer, $gzipencode );
+    if ( defined( $config{HTTP}{RedirectCode} ) ) {
+      $rsp->code( $config{HTTP}{RedirectCode} );
+    }
+    $rtype = 'redirect';
+    $rloc  = $req . ' -> ' . $config{HTTP}{REDIRECTS}{$req};
+  }
+
+  # Handle Error.
+  else {
+    if ( defined( $config{HTTP}{REDIRECTS}{ErrorHandler} ) ) {
+      $oreq = $req;
+      &__response_handler( '/' . $config{HTTP}{REDIRECTS}{ErrorHandler},
+                           $ip, $timer, $gzipencode );
+      $rloc  = $req . ' -> ' . $oreq;
+      $rtype = 'error';
+    }
+    else { __out 'Error: invalid request, cannot respond'; }
+    $rsp->code(500);
+    $rtype = 'error';
+    $rloc  = $req;
+  }
+
+  # This is equivelant to the Apache Access Log.
+  # The format is IP Request_Type *[Content_Type] Content_Location
+  # Time_To_Render.
+  if ( defined($ctype) ) {
+    &__log( "$ip $rtype $ctype $rloc " . __timer($timer) . 'ms', 'info' );
+  }
+  else {
+    &__log( "$ip $rtype $rloc " . __timer($timer) . 'ms', 'info' );
+  }
+
+  # Replace changed Signals.
+  &__sig_handler('http');
+
+  # Return result for all page.
+  # Encode if neccesary as GZIP, and return result.
+  if ( defined( $config{HTTP}{GZipEncode} ) ) {
+    if ( $config{HTTP}{GZipEncode} ) {
+      if ($gzipencode) {
+        $gzin = __out;
+        if ( gzip \$gzin => \$gzout, AutoClose => 1 ) {
+          $rsp->header( 'Content-Encoding' => 'gzip' );
+          return $gzout;
+        }
+      }
+    }
+  }
+
+  return __out;
+}
+
+################################################################################
+# HTTP Communications Handler.
+# The main while loop for each HTTP server.
+# Keep looping each handler until MaxReq is hit, or the handler exits
+# prematurely.
+################################################################################
+sub __http {
+  my $timer;    # Timer for ...
+  my $rcnt = 0; # Request Counter.
+  my $cookie;   # Cookie Storage.
+  my $req;      # Request object.
+  my $c;        # Client object.
+  my $ip;       # Client IP Address.
+  my $qs;       # Query String.
+  my $surl;     # Stripped URL.
+  my $gzipencode = 0;    # GZIP Encoding Support.
+
+  while ( $rcnt <= $config{HTTP}{MaxWebReq} ) {
+
+    # Rename Exception if the MaxWebReq is 0, that means it's unlimited.
+    if ( $config{HTTP}{MaxWebReq} ) {
+      __renproc 'http',
+        'serving request ' . $rcnt . '/' . $config{HTTP}{MaxWebReq};
+    }
+    else { __renproc 'http', 'serving requests'; }
+
+    # Setup Client Connection.
+    if ( $c = $hdo->accept ) {
+      $rsp = HTTP::Response->new;
+      $c->autoflush(1);
+
+      # Cleanup up variable content.
+      __out $config{INT}{OutReset};
+
+      # Start Data Collection after accept.
+      $timer = __timer;
+
+      # Setup Alarm.
+      &__timeout_handler( 'http', 'start' );
+
+      # Get Request.
+      # Check on the type of request that has been asked for.
+      if ( $req = $c->get_request ) {
+
+        # Dump the contents of the request.
+        if ( defined( $config{HTTP}{DebugReq} ) ) {
+          if ( $config{HTTP}{DebugReq} ) {
+            print Dumper $req;
+          }
+        }
+
+        # Get Some Connection Specific Credentials.
+        $ip = $c->peerhost;
+
+        # Check Request Method.
+        # And act according to the required information exchange.
+        if (    $req->method eq 'GET'
+             || $req->method eq 'PUT'
+             || $req->method eq 'POST' )
+        {
+          __log 'request method [' . $req->method . '] requested';
+
+          # Session Handler.
+          if ( defined( $req->as_string ) ) {
+
+            # Check if a Cookie is defined.
+            # Directly from the Request Header.
+            if ( defined( $cookie = $req->header('Cookie') ) ) {
+              $cookie = $req->header('Cookie');
+            }
+            else { $cookie = ''; }
+
+            # Set Cookie if none is Set.
+            if ( !&__session_handler( 'get', $cookie ) ) {
+              $rsp->header( 'Set-Cookie' => &__session_handler('set') );
+            }
+
+            # Check if GZIP Encoding is possible.
+            if ( defined( $gzipencode = $req->header('Accept-Encoding') ) ) {
+              $gzipencode = $req->header('Accept-Encoding');
+              $gzipencode = 1 if ( $gzipencode =~ /gzip/ );
+              __log 'gzip encoding supported';
+            }
+
+          }
+          else {
+            __log $ip
+              . ' invalid request method requested "'
+              . $req->method . '"';
+            $rsp->code(300);
+          }
+        }
+        else {
+          __log $ip
+            . ' invalid request method requested "'
+            . $req->method . '"';
+          $rsp->code(300);
+        }
+
+        # Get user supplied data via POST, PUT methods.
+        # Parse them, and assign them to the session.
+        if ( defined( $req->content ) ) {
+          if ( $req->content ne '' ) {
+            &__querystring( $sid, $req->method, $req->content );
+          }
+        }
+
+        # Get user supplied data via GET methods.
+        # Parse them, and assign them to the session.
+        # We strip the additions here \?.* to allow processing
+        # (response) to the URL without intervention.
+        if ( defined( $req->url ) ) {
+          $surl = $req->url;
+          if ( $req->url =~ qr/(.*)\?(.*)/ ) {
+            $surl = $1;
+            $qs   = $2;
+            if ( defined($qs) ) {
+              &__querystring( $sid, $req->method, $qs ) if ( $qs ne '' );
+            }
+          }
+        }
+
+        # Handle Responses based on Request.
+        # Render Output, and send response to client.
+        $rsp->content( &__response_handler( $surl, $ip, $timer, $gzipencode ) );
+        $c->send_response($rsp);
+        if ( defined( $config{HTTP}{DebugRsp} ) ) {
+          __log Dumper $rsp if ( $config{HTTP}{DebugRsp} );
+        }
+
+        # Cleaup if session cleanup is required after each call.
+        # We DO NOT cleanup the stash.
+        if ( defined( $config{HTTP}{SESSION}{Enabled} ) ) {
+          if ( $config{HTTP}{SESSION}{Enabled} ) {
+            if ( defined( $config{HTTP}{SESSION}{Cleanup} ) ) {
+              if ( $config{HTTP}{SESSION}{Cleanup} ) {
+                if ( defined( $config{HTTP}{SESSION}{Debug} ) ) {
+                  __log 'cleaning up after session :' . $sid;
+                }
+                &__ipccache( 'cleanup', $sid );
+              }
+            }
+          }
+        }
+
+      }
+      else { last; }
+
+      # Setup Alarm.
+      &__timeout_handler( 'http', 'clear' );
+
+      $c->close;
+
+    }
+    else { last; }
+    $rcnt++ unless ( $config{HTTP}{MaxWebReq} == 0 );
+  }
+
+  # End of the worker's lifetime.
+  __log 'process [' . $$ . '] terminated after [' . $rcnt . '] request(s)';
+  exit;
+}
+
+################################################################################
+# Process Handler.
+# Forks a Process, and installs relevant Signal Handlers.
+################################################################################
+sub __proc_handler {
+  my ( $name, $subref, $max ) = @_;
+  my $sigset       = POSIX::SigSet->new(SIGINT);
+  my $timer        = __timer;
+  my $subref_strip = $subref;
+  my $pid;
+
+  # Check the max number of processes that are running at the same time.
+  # Do not spawn if max has been reached.
+  $max = 1 if ( !defined($max) );
+  if ( defined( $procs{count}{$name} ) ) {
+    if ( $procs{count}{$name} >= $max ) { return 0; }
+    else {
+      __log $name
+        . ' concurrency throttler '
+        . $procs{count}{$name} . ' >= '
+        . $max;
+    }
+  }
+
+  # Log some details about the call.
+  __log 'Name       : ' . $name;
+  __log 'Subroutine : ' . $subref;
+  __log 'Concurrency: ' . $max;
+
+  if ( sigprocmask( SIG_BLOCK, $sigset ) ) {
+    if ( defined( $pid = fork ) ) {
+
+      # If successfull fork.
+      if ($pid) {
+        $procs{$name}{$pid} = 1;
+        $procs{count}{$name}++;
+        __log $name . ' process [' . $pid . '] spawned';
+        __log $name . ' process count = ' . $procs{count}{$name};
+
+        # Process has been forked.
+        # Return to the parent process, and leave child to carry on.
+        return 1;
+      }
+
+      # Install Signals that are required.
+      # Handler to be run.
+      &__sig_handler($name);
+
+      # Check that the subref has been defined, and strip for
+      # configuration purposes.
+      $subref_strip =~ s/__//g;
+      if ( &__db_handler( 'connect', $subref_strip ) ) {
+
+        # Invoke the Subroutine.
+        eval {
+          no strict 'refs';
+          &{$subref};
+        };
+
+        # Show time process run for.
+        __log $name . ' process completed in ' . __timer($timer) . ' ms';
+
+        # Disconnect from the database.
+        # Exit the Process.
+        &__db_handler('disconnect');
+        exit(0);
+      }
+
+      # Unsuccessfull Database connection.
+      exit(1);
+    }
+    else { croak $name . ' cannot fork - ' . $!; }
+  }
+  else { croak $name . 'cannnot block SIGINT for fork - ' . $!; }
+}
+
+################################################################################
+# HTTP Communications Handler (Process).
+################################################################################
+sub __http_handler {
+  my ($cmd) = @_;
+
+  # Check if HTTP Has been Enabled.
+  if ( defined( $config{HTTP}{Enabled} ) ) {
+    if ( !$config{HTTP}{Enabled} ) { return 1; }
+  }
+  else { croak 'HTTP::Enabled not defined in configuration file'; }
+
+  # Setup the HTTP Daemon Object.
+  if ( $cmd eq 'initialize' ) {
+    if ( $hdo = HTTP::Daemon->new( %{ $config{HTTP}{DAEMON} } ) ) {
+      __log 'http daemon setup successfully';
+      return 1;
+    }
+    else { __log 'cannot setup http daemon'; }
+  }
+
+  # Pre-Fork, and Re-Spawn missing http processes.
+  # Return on complete.
+  # We disregard the return value here.
+  if ( $cmd eq 'fork' ) {
+    while (1) {
+      return 1
+        if (
+           !&__proc_handler( 'http', '__http', $config{HTTP}{MaxWebWorkers} ) );
+    }
+  }
+
+  return 0;
+}
+
+################################################################################
+# Handle All Housekeeping Requests.
+# Run Defined Script(s) For Supervisor if it has been defined.
+################################################################################
+sub __hkeeper_handler {
+  my ( $key, $sc, $dur );
+
+  # Check if Scripts Have Been Disabled.
+  if ( defined( $config{HKEEPER}{Enabled} ) ) {
+    return 1 if ( !$config{HKEEPER}{Enabled} );
+  }
+
+  # Return if no Scripts Have Been Defined.
+  return 1 if ( !defined( $config{HKEEPER}{SCRIPTS} ) );
+
+  foreach $key ( sort keys %{ $config{HKEEPER}{SCRIPTS} } ) {
+    if ( $key =~ m/^(\w+):(@?\d+)$/ ) {
+      $sc  = $1;
+      $dur = $2;
+      if ( $dur =~ m/^@(\d+)$/ ) {
+        if ( &__tstamp eq substr( $1, 0, length($1) ) ) {
+          if ( defined( $config{HKEEPER}{Debug} ) ) {
+            if ( $config{HKEEPER}{Debug} ) {
+              __log 'Script Handle       : ' . $sc;
+              __log 'Invokation Time     : ' . $1;
+              __log 'Running job type [@]: ' . $config{HKEEPER}{SCRIPTS}{$key};
+            }
+          }
+
+          # Execute Script.
+          # We Are Temporarily invoking using passing a value to a hash
+          # until we cleanup the proc_handler sub.
+          $script{current_script} = $config{HKEEPER}{SCRIPTS}{$key};
+          &__proc_handler( 'housekeeper', '__housekeeper',
+                           $config{HKEEPER}{MaxHouseKeepers} );
+          return 1;
+        }
+      }
+      else {
+        if ( defined( $script{$sc} ) ) {
+          if ( $script{$sc} le time ) {
+            if ( defined( $config{HKEEPER}{Debug} ) ) {
+              if ( $config{HKEEPER}{Debug} ) {
+                __log 'Invocation          : ' . $script{$sc};
+                __log 'Current Time        : ' . time;
+                __log 'Script Handle       : ' . $sc;
+                __log 'Invokation Time     : ' . $dur;
+                __log 'Running job type [T]: '
+                  . $config{HKEEPER}{SCRIPTS}{$key};
+              }
+            }
+
+            # Delete the Counter, and Execute Script.
+            # We Are Temporarily invoking using passing a value to a hash
+            # until we cleanup the proc_handler sub.
+            $script{current_script} = $config{HKEEPER}{SCRIPTS}{$key};
+            &__proc_handler( 'housekeeper', '__housekeeper',
+                             $config{HKEEPER}{MaxHouseKeepers} );
+            delete $script{$sc};
+            return 1;
+          }
+        }
+
+        # Set the Duration Based on the Invocation Time.
+        else { $script{$sc} = time + $dur; }
+      }
+    }
+    else {
+      __log 'unknown syntax: Script:Handle:@?nnnnn=<script>';
+    }
+  }
+
+  # Default Return.
+  return 0;
+}
+
+################################################################################
+# Output Redirector.
+# Close STDIN, and STDERR, and STDIN.
+################################################################################
+sub __output_handler {
+  my ($cmd) = @_;
+
+  if ( $cmd eq 'start' ) {
+    if ( defined( $config{LOG}{LogFile} ) ) {
+      if ( open( $fhs{output}, '>>', &__locstd( $config{LOG}{LogFile} ) ) ) {
+
+        # To avoid errors, just print nothing using the filehandle.
+        print { $fhs{output} } '';
+
+        # Redirect OUTPUT to Log File.
+        open( STDOUT, '>&', $fhs{output} );
+        open( STDERR, '>&', $fhs{output} );
+        close(STDIN);
+        return 1;
+      }
+      else { __log 'cannot open log file for writing'; }
+    }
+    else { __log 'log file not defined'; }
+  }
+  elsif ( $cmd eq 'stop' ) {
+    close( $fhs{output} );
+    return 1;
+  }
+  return 0;
+}
+
+################################################################################
+# Daemon Handler.
+################################################################################
+sub __daemon {
+  my ($cmd)  = @_;
+  my $sigset = POSIX::SigSet->new(SIGINT);
+  my $scnt   = 0;                            # Spinner Counter.
+  my ( $pid, $key );
+
+  if ( $cmd eq 'start' ) {
+    __log 'starting server daemon';
+    if ( sigprocmask( SIG_BLOCK, $sigset ) ) {
+      if ( defined( $pid = fork and return 1 ) ) {
+        if (setsid) {
+          if ( &__pidchk( &__locstd( $config{INT}{PidFile} ), 'lock' ) ) {
+
+            # Fail if Cannot Initialize HTTP Daemon Handler.
+            # This is only when it is enabled ofcourse.
+            # Note: The HTTP server is an integral part of this application
+            # and so the application should fail if this specific component
+            # cannot be started successfully.
+            return 0 if ( !&__http_handler('initialize') );
+
+            if ( &__output_handler('start') ) {
+
+              # Setup Signals we want to catch.
+              &__sig_handler('supervisor');
+
+              # Setup Syslog Defaults.
+              &__log_handler;
+
+              # Our Infinite Loop.
+              while (1) {
+                $scnt = __renproc "$scnt*supervisor";
+
+                # Pre-Fork, and Re-Spawn missing http processes.
+                &__http_handler('fork');
+
+                # Run HouseKeeper Handler.
+                # This should invoke housekeepers based on duration, and
+                # based on invocation time.
+                &__hkeeper_handler;
+
+                # Check if Configuration Needs reloading.
+                &__config_handler( &__locstd($confrel) );
+
+                # Invoke Garbage Collector.
+                &__ipccache('collector');
+
+                # Sleep 1 second between Cycles.
+                # This is ofcourse mandetory otherwise you will utilize the
+                # CPU 100%.
+                sleep 1;
+
+              }
+
+              # Return 1 as in Successfull End After Infinite While Loop.
+              return 1;
+
+            }
+          }
+        }
+        else { croak 'cannot start new session: ' . $!; }
+      }
+      else { croak 'cannot fork worker: ' . $!; }
+    }
+    else { croak 'cannot block SIGINT for fork: ' . $!; }
+  }
+
+  # If Command given to daemon is stop.
+  if ( $cmd eq 'stop' ) {
+    if ( !&__pidchk( &__locstd( $config{INT}{PidFile} ), 'unlock' ) ) {
+      __log 'server daemon not running';
+    }
+    else { return 1; }
+  }
+  return 0;
+}
+
+################################################################################
+# Initialize The Application.
+# System basic initialization of some required variables.  If the initialization
+# sub is unsuccessful, then the application should not be started.
+################################################################################
+sub __init {
+  my ($bin);
+
+  $|++;
+
+  # Force flush after each write.
+  $| = 1;
+
+  # Cleanup Path.
+  delete $ENV{PATH} if ( defined( $ENV{PATH} ) );
+
+  # Get Absolute Directory Installation Path.
+  $RealBin =~ s/(.*)\/\w+/$1/;
+  $RealBin =~ /^(\/[\w\-\s\.\/]+\w+)$/;
+  $RealBin = $1;
+
+  # Get Binary Name.
+  $bin = $0;
+  $bin =~ s/\/(.*)$/$1/;
+
+  # Default Values for Config Variables.
+  # These will be set to these values if not defined by the user.
+  $config{INT}{ProcessName}         = $bin;
+  $config{INT}{OutReset}            = 'RESET';
+  $config{INT}{Static}              = 'static';
+  $config{INT}{Dynamic}             = 'dynamic';
+  $config{INT}{URIRegex}            = '\w[\w\.\-]+';
+  $config{INT}{GlobalStash}         = 'my';
+  $config{INT}{ConfigStash}         = 'config';
+  $config{HTTP}{SESSION}{TimeOut}   = 3600;
+  $config{HTTP}{SESSION}{dBFile}    = '/tmp';
+  $config{HTTP}{SESSION}{Debug}     = 0;
+  $config{HTTP}{MaxWebWorkers}      = 3;
+  $config{HTTP}{MaxWebReq}          = 9;
+  $config{HTTP}{RedirectCode}       = 302;
+  $config{HKEEPER}{MaxHouseKeepers} = 0;
+  $config{LOG}{SUBS}{ALL}           = 1;
+
+  # Mangle Global Variable Version Number from CVS.
+  $version =~ s/\$.*:\s*([\d\.]+)\s*\$/$1/;
+  __log $bin . ' version ' . $version;
+
+  # Load Configuration.
+  if ( &__config_handler( &__locstd($confrel) ) ) {
+
+    # Setup the SyncDB File for the Sessions.
+    return &__ipccache('initialize');
+  }
+  return 0;
+}
+
+################################################################################
+# This is where the program starts execution of the various components as
+# controlled from the command line. The options that are required should be
+# added to the $flags scalar, and then invoked under the getopts call.
+################################################################################
+MAIN: {
+  my $flags = "cdtDM";
+
+  if ( getopts( $flags, \my %flag ) ) {
+
+    # Optional arguments that can be compounded should be listed here.
+    # These are switches to turn things on and off, or modify pre runtime
+    # values.
+    if ( $flag{c} ) { $confrel = $flag{c}; }
+
+    if (__init) {
+
+      # The Application has already been initialized here.
+      # Options that can only be invoked independantly of each other.
+      # These should all be elsifs after the first if.
+      # The else therefore serves as a reminder.
+      if    ( $flag{d} ) { &__daemon('start'); }
+      elsif ( $flag{t} ) { &__daemon('stop'); }
+      elsif ( $flag{D} ) { print Dumper %config; }
+      elsif ( $flag{M} ) { print Dumper %shmem; }
+      else { __log 'invocation requires flag(s) [-' . $flags . ']'; }
+
+      # Return Shell OK (0).
+      exit 0;
+
+    }
+    else { __log 'initialization failed'; }
+  }
+  else { __log 'getopt failure, check options'; }
+
+  # Return Shell Error (1).
+  exit 1;
+}
