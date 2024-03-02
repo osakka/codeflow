@@ -1,0 +1,115 @@
+<html>
+ <head> 
+
+  [[[
+    uri_title ( title = "CodeFlow Application Server" );
+    link_css  ( loc = "basic.css" );
+    link_css  ( loc = "menubar.css" );
+    link_js   ( loc = "codeflow.js" );
+
+  ]]]
+
+  <script>
+    (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+    (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+    m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+    })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+    ga('create', 'UA-46551763-1', 'itdlabs.net');
+    ga('send', 'pageview');
+  </script>
+
+ </head> 
+
+ <body>
+
+  <div id='codeflow' onreadystatechange="stopwatch()">
+
+  [[[
+
+    codeflow_menu = [
+      {
+        name = 'Overview',
+        include = 'motd.inc',
+        location = '',
+      },
+      {
+        name = 'Applications',
+        include = 'apps.inc',
+        location = 'apps',
+      },
+      {
+        name = 'Configuration',
+        include = 'config.inc',
+        location = 'config',
+      },
+      {
+        name = 'Stash Inspector', 
+        submenu = [
+          {
+            name = 'Session Stash',
+            location = 'session_stash',
+            block = 'stash',
+          },
+          {
+            name = 'Request Variables',
+            location = 'request_stash',
+            block = 'stash',
+          },
+          {
+            name = 'Query String',
+            location = 'query_stash',
+            block = 'stash',
+          },
+          {
+            name = 'Application Stash',
+            location = 'application_stash',
+            block = 'stash',
+          },
+          {
+            name = 'Server Stash',
+            location = 'server_stash',
+            block = 'stash',
+          },
+
+        ],
+      },
+      {
+        name = 'About',
+        include = 'about.inc',
+        location = 'about',
+      },
+    ];
+
+    BLOCK stash;
+      '<h1>Stash Dump Request</h1>';
+      'The dump below is for the '; request.redirect; '<br>';
+      '<pre>';
+
+      USE Dumper;
+      SWITCH request.redirect;
+        CASE 'server_stash';       Dumper.dump_html(server);
+        CASE 'session_stash';      Dumper.dump_html(session);
+        CASE 'request_stash';      Dumper.dump_html(request);
+        CASE 'application_stash';  Dumper.dump_html(applications);
+        CASE 'query_stash';
+          '<br>GET Method:<br>';  Dumper.dump(get);
+          '<br>PUT Method:<br>';  Dumper.dump(put);
+          '<br>POST Method:<br>'; Dumper.dump(post);
+        CASE;                      'unknown variable stash requested.';
+      END;
+      '</pre>';
+    END;
+
+    menubar( entries = codeflow_menu location = request.redirect );
+
+ ]]]
+
+  <div id='codeflow_toggle_div'>
+   <a id="codeflow_toggle" href="/hideconsole">Hide</a>
+  </div>
+
+
+ </div>
+ </body>
+
+</html>

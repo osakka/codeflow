@@ -1,0 +1,187 @@
+/*
+ *
+ * We Set background for non-css3 browsers
+ *        filter     for IE
+ *        background with -webkit-gradient for webkit browsers 
+ *        background with -moz-linear-gradient for firefox 3.6+
+**/
+
+#menubar {
+  font                      : normal .8em/1.5em Arial, Helvetica, sans-serif;
+
+  margin                    : 0 3 0 3;
+  padding                   : 0 0 0 0;
+  height                    : 31px;
+
+  border                    : solid 1px #6d6d6d;
+  border-top                : solid 1px #9f9f9f;
+  border-radius             : 0 0 7 7;
+  -webkit-border-radius     : 0 0 7 7;
+  -moz-border-radius        : 0 0 7 7;
+
+  -webkit-box-shadow        : 0 1px 3px rgba(0, 0, 0, .4);
+  -moz-box-shadow           : 0 1px 3px rgba(0, 0, 0, .4);
+
+  background                : #8b8b8b;
+  filter                    : progid:DXImageTransform.Microsoft.gradient(startColorstr='#bababa', endColorstr='#7a7a7a');
+  background                : -webkit-gradient(linear, left top, left bottom, from(#bababa), to(#7a7a7a));
+  background                : -moz-linear-gradient(top, #bababa, #7a7a7a);
+
+}
+
+#appname {
+  margin                    : 0 0 0 0;
+  padding                   : 7 16 0 0;
+  float                     : right;
+  font                      : bold 1em Arial, Helvetica, sans-serif;
+  color                     : #eee;
+  text-shadow               : -1px 0 #777, 0 1px #777, 1px 0 #777, 0 -1px #777;
+}
+
+/* main ul specifications */
+#nav {
+  margin                    : 0 0 0 0;
+  padding                   : 0 0 0 15;
+  list-style                : none;
+  float                     : left;
+}
+
+/* entry containers (li)s */
+#nav li {
+  /* for spacing at start of entries */
+  margin                    : 0 0;
+  padding                   : 0 0 2 0;
+  float                     : left;
+  position                  : relative;
+  list-style                : none;
+}
+
+/* main level link */
+#nav a {
+  font-weight               : normal;
+  color                     : #e7e5e5;
+  text-decoration           : none;
+  display                   : block;
+  /* width of entries */
+  padding                   : 5 15;
+  margin                    : 0 0 0 0;
+
+  -webkit-border-radius     : 0;
+  -moz-border-radius        : 0;
+
+  text-shadow               : 0 1px 1px rgba(0, 0, 0, .3);
+}
+
+/* main level link hover */
+#nav li:hover > a {
+  background                : #d1d1d1;
+  filter                    : progid:DXImageTransform.Microsoft.gradient(startColorstr='#ebebeb', endColorstr='#a1a1a1');
+  background                : -webkit-gradient(linear, left top, left bottom, from(#ebebeb), to(#a1a1a1));
+  background                : -moz-linear-gradient(top,  #ebebeb,  #a1a1a1);
+ 
+  color                     : #444;
+
+  border-top                : solid 1px #f8f8f8;
+  border-bottom             : solid 1px #a1a1a1;
+
+  -webkit-box-shadow        : 0 1px 1px rgba(0, 0, 0, .2);
+  -moz-box-shadow           : 0 1px 1px rgba(0, 0, 0, .2);
+  box-shadow                : 0 1px 1px rgba(0, 0, 0, .2);
+
+  text-shadow               : 0 1px 0 rgba(255, 255, 255, .8);
+}
+
+#nav .current a {
+  background                : #d1d1d1;
+  filter                    : progid:DXImageTransform.Microsoft.gradient(startColorstr='#404040', endColorstr='#a1a1a1');
+  background                : -webkit-gradient(linear, left top, left bottom, from(#404040), to(#a1a1a1));
+  background                : -moz-linear-gradient(top,  #404040, #a1a1a1);
+
+  color                     : #ddd;
+
+  border-top                : solid 1px #000;
+  border-bottom             : solid 1px #b4b4b4;
+
+  -webkit-box-shadow        : 0 1px 1px rgba(0, 0, 0, .2);
+  -moz-box-shadow           : 0 1px 1px rgba(0, 0, 0, .2);
+  box-shadow                : 0 1px 1px rgba(0, 0, 0, .2);
+}
+
+/* sub levels link hover */
+#nav ul li:hover a, #nav li:hover li a {
+  background                : none;
+  border                    : none;
+  color                     : #666;
+  -webkit-box-shadow        : none;
+  -moz-box-shadow           : none;
+}
+
+#nav ul a:hover {
+  background                : #0399d4 !important;
+  color                     : #fff !important;
+  text-shadow               : 0 1px 1px rgba(0, 0, 0, .1);
+}
+
+/* level 2 list */
+#nav ul {
+  background                : #fff;
+  filter                    : alpha(opacity=80);
+  opacity                   : .80;
+
+  z-index                   : 100;
+ 
+  display                   : none;
+  margin                    : 0;
+  padding                   : 0;
+  width                     : 225px;
+  position                  : absolute;
+  top                       : 30px;
+  left                      : 0px;
+
+  -webkit-border-radius     : 0 0 3 3;
+  -moz-border-radius        : 0 0 3 3;
+  border-radius             : 0 0 3 3;
+
+  -webkit-box-shadow        : 0 1px 3px rgba(0, 0, 0, .3);
+  -moz-box-shadow           : 0 1px 3px rgba(0, 0, 0, .3);
+  box-shadow                : 0 1px 3px rgba(0, 0, 0, .3);
+}
+
+/* dropdown */
+#nav li:hover > ul {
+  display                   : block;
+}
+
+#nav ul li {
+  float: none;
+  margin: 0;
+  padding: 0;
+}
+#nav ul a {
+	font-weight: normal;
+	text-shadow: 0 1px 1px rgba(255, 255, 255, .9);
+}
+/* level 3+ list */
+#nav ul ul {
+	left: 181px;
+	top: -3px;
+}
+
+/* rounded corners for first and last child */
+#nav ul li:last-child > a {
+  -webkit-border-bottom-left-radius  : 3px;
+  -moz-border-radius-bottomleft      : 3px;
+  -webkit-border-bottom-right-radius : 3px;
+  -moz-border-radius-bottomright     : 3px;
+}
+
+
+/* clearfix */
+#nav:after {
+  content                   : ".";
+  display                   : block;
+  clear                     : both;
+  visibility                : hidden;
+  line-height               : 0;
+  height                    : 0;
+}
